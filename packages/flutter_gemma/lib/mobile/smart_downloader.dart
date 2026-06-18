@@ -238,10 +238,10 @@ class SmartDownloader {
       return;
     }
 
-    // Generate deterministic taskId based on URL + targetPath
-    // This prevents duplicate downloads of the same file
+    // Generate unique taskId based on URL + targetPath + timestamp
+    // This avoids database/WorkManager task collision when cancelling and quickly restarting
     final taskId =
-        '${url.hashCode.toUnsigned(32).toRadixString(16)}_${targetPath.hashCode.toUnsigned(32).toRadixString(16)}';
+        '${url.hashCode.toUnsigned(32).toRadixString(16)}_${targetPath.hashCode.toUnsigned(32).toRadixString(16)}_${DateTime.now().millisecondsSinceEpoch}';
 
     gemmaLog(
       '🔵 _downloadWithSmartRetry called - attempt $currentAttempt/$maxRetries',
@@ -256,11 +256,26 @@ class SmartDownloader {
     try {
       final downloader = FileDownloader();
 
+      final (baseDirectory, directory, filename) = await Task.split(
+        filePath: targetPath,
+      );
+
       // Check if task already exists (e.g., after app restart or sleep/wake)
-      final existingTask = await downloader.taskForId(taskId);
+      DownloadTask? existingTask;
+      try {
+        final activeTasks = await downloader.allTasks(group: _downloadGroup);
+        for (final t in activeTasks) {
+          if (t.url == url && t.filename == filename && t is DownloadTask) {
+            existingTask = t;
+            break;
+          }
+        }
+      } catch (_) {}
+
       if (existingTask != null) {
+        final existingTaskId = existingTask.taskId;
         gemmaLog(
-          '🔵 Task $taskId already in progress, attaching to existing...',
+          '🔵 Task $existingTaskId already in progress, attaching to existing...',
         );
 
         // Create completer to wait for existing task completion
@@ -268,7 +283,7 @@ class SmartDownloader {
 
         // Attach listener to existing task
         listener = _getUpdatesStream().listen((update) async {
-          if (update.task.taskId != taskId) return;
+          if (update.task.taskId != existingTaskId) return;
 
           if (update is TaskProgressUpdate) {
             final percents = (update.progress * 100).round();
@@ -305,15 +320,11 @@ class SmartDownloader {
         });
 
         onListenerCreated?.call(listener);
-        onTaskCreated?.call(taskId);
+        onTaskCreated?.call(existingTaskId);
 
         await completer.future;
         return;
       }
-
-      final (baseDirectory, directory, filename) = await Task.split(
-        filePath: targetPath,
-      );
 
       // Auto-detect allowPause based on URL
       // HuggingFace uses weak ETags - resume not reliable
